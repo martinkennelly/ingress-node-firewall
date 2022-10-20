@@ -13,6 +13,7 @@ import (
 	"github.com/openshift/ingress-node-firewall/pkg/metrics"
 
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/util/retry"
 )
 
@@ -167,10 +168,14 @@ func (e *ebpfSingleton) resetAll() error {
 // It is possible that an attach operation fails with "already attached" while a previous detach operation is
 // still in progress. Thus, if IngressNodeFwAttach fails, retry on error.
 func (e *ebpfSingleton) attachNewInterfaces(ifaceIngressRules map[string][]v1alpha1.IngressNodeFirewallRules) error {
+	var errors []error
 	for intf := range ifaceIngressRules {
 		// First, check if the interface name is valid.
 		if !isValidInterfaceNameAndState(intf) {
-			return fmt.Errorf("Fail to attach ingress node Firewall rules: invalid interface %s", intf)
+			err := fmt.Errorf("fail to attach ingress node Firewall rules: invalid interface %s", intf)
+			e.log.Error(err, "Fail to attach ingress firewall rules")
+			errors = append(errors, err)
+			continue
 		}
 
 		// Then, check if the interface is already managed.
@@ -191,11 +196,11 @@ func (e *ebpfSingleton) attachNewInterfaces(ifaceIngressRules map[string][]v1alp
 					return nil
 				})
 			if err != nil {
-				return err
+				errors = append(errors, err)
 			}
 		}
 	}
-	return nil
+	return apierrors.NewAggregate(errors)
 }
 
 // detachUnmanagedInterfaces detaches any interfaces that were managed by us but that should not be managed any more.
