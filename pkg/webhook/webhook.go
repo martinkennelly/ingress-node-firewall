@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"slices"
 	"strings"
 
 	ingressnodefwv1alpha1 "github.com/openshift/ingress-node-firewall/api/v1alpha1"
@@ -59,7 +60,7 @@ func (r *IngressNodeFirewallWebhook) ValidateDelete(_ context.Context, _ *ingres
 }
 
 func validateIngressNodeFirewall(ctx context.Context, inf *ingressnodefwv1alpha1.IngressNodeFirewall, kubeClient client.Client) error {
-	if allErrs := validateINFRules(ctx, inf.Spec.Ingress, inf.Name, inf.Spec.NodeSelector, kubeClient); len(allErrs) > 0 {
+	if allErrs := validateINFRules(ctx, inf.Spec.Ingress, inf.Name, inf.Spec.NodeSelector, inf.Spec.Interfaces, kubeClient); len(allErrs) > 0 {
 		return apierrors.NewInvalid(
 			schema.GroupKind{Group: ingressnodefwv1alpha1.GroupVersion.Group, Kind: ingressnodefwv1alpha1.IngressNodeFirewall{}.Kind},
 			inf.Name, allErrs)
@@ -101,7 +102,7 @@ func validateINFInterfaces(ctx context.Context, infInterfaces []string, infName 
 }
 
 func validateINFRules(ctx context.Context, infRules []ingressnodefwv1alpha1.IngressNodeFirewallRules, infName string,
-	nodeSelector v1.LabelSelector, kubeClient client.Client) field.ErrorList {
+	nodeSelector v1.LabelSelector, interfaces []string, kubeClient client.Client) field.ErrorList {
 	var allErrs field.ErrorList
 
 	infList, newErr := getINFList(ctx, kubeClient)
@@ -111,6 +112,8 @@ func validateINFRules(ctx context.Context, infRules []ingressnodefwv1alpha1.Ingr
 	}
 
 	for infRulesIndex, infRule := range infRules {
+		allErrs = append(allErrs, validateBrExFailsafeRules(interfaces, infRule.FirewallProtocolRules, infRulesIndex)...)
+
 		if newErrs := validatesourceCIDRs(allErrs, infRule.SourceCIDRs, infRulesIndex, infName); len(newErrs) > 0 {
 			allErrs = append(allErrs, newErrs...)
 		}
@@ -122,6 +125,24 @@ func validateINFRules(ctx context.Context, infRules []ingressnodefwv1alpha1.Ingr
 		if newErrs := validateAgainstExistingINFs(allErrs, infList, infRule.SourceCIDRs, infRule.FirewallProtocolRules,
 			infRulesIndex, infName, nodeSelector); len(newErrs) > 0 {
 			allErrs = append(allErrs, newErrs...)
+		}
+	}
+	return allErrs
+}
+
+func validateBrExFailsafeRules(interfaces []string, rules []ingressnodefwv1alpha1.IngressNodeFirewallProtocolRule, infRulesIndex int) field.ErrorList {
+	if !slices.Contains(interfaces, "br-ex") {
+		return nil
+	}
+
+	var allErrs field.ErrorList
+	for ruleIndex, rule := range rules {
+		// An empty protocol matches every transport protocol and destination port
+		// in the datapath, including the control-plane ports protected by the failsafe rules.
+		if rule.ProtocolConfig.Protocol == "" && rule.Action == ingressnodefwv1alpha1.IngressNodeFirewallDeny {
+			allErrs = append(allErrs, field.Forbidden(
+				field.NewPath("spec").Child("ingress").Index(infRulesIndex).Key("rules").Index(ruleIndex),
+				"deny-all rules on br-ex conflict with control-plane failsafe ports; specify an explicit protocol"))
 		}
 	}
 	return allErrs

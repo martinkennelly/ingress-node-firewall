@@ -32,6 +32,7 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	admissionv1beta1 "k8s.io/api/admission/v1beta1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	//+kubebuilder:scaffold:imports
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -581,6 +582,46 @@ var _ = Describe("Pin holes", func() {
 		})
 
 	})
+	Context("br-ex failsafe validation", func() {
+		tests := []struct {
+			name       string
+			interfaces []string
+			action     ingressnodefwv1alpha1.IngressNodeFirewallActionType
+			protocol   ingressnodefwv1alpha1.IngressNodeProtocolConfig
+			forbidden  bool
+		}{
+			{name: "reject deny-all rule on br-ex", interfaces: []string{"br-ex"}, action: ingressnodefwv1alpha1.IngressNodeFirewallDeny, forbidden: true},
+			{name: "reject deny-all rule on mixed interfaces including br-ex", interfaces: []string{"eth0", "br-ex"}, action: ingressnodefwv1alpha1.IngressNodeFirewallDeny, forbidden: true},
+			{name: "accept allow-all rule on br-ex", interfaces: []string{"br-ex"}, action: ingressnodefwv1alpha1.IngressNodeFirewallAllow},
+			{name: "accept deny-all rule on another interface", interfaces: []string{"eth0"}, action: ingressnodefwv1alpha1.IngressNodeFirewallDeny},
+			{name: "accept deny-all rule on br-ex1 because interface must match exactly", interfaces: []string{"br-ex1"}, action: ingressnodefwv1alpha1.IngressNodeFirewallDeny},
+			{name: "accept deny rule for unprotected TCP port on br-ex", interfaces: []string{"br-ex"}, action: ingressnodefwv1alpha1.IngressNodeFirewallDeny,
+				protocol: ingressnodefwv1alpha1.IngressNodeProtocolConfig{Protocol: ingressnodefwv1alpha1.ProtocolTypeTCP, TCP: &ingressnodefwv1alpha1.IngressNodeFirewallProtoRule{Ports: intstr.FromInt(80)}}},
+			{name: "reject deny rule for protected TCP port on br-ex", interfaces: []string{"br-ex"}, action: ingressnodefwv1alpha1.IngressNodeFirewallDeny, forbidden: true,
+				protocol: ingressnodefwv1alpha1.IngressNodeProtocolConfig{Protocol: ingressnodefwv1alpha1.ProtocolTypeTCP, TCP: &ingressnodefwv1alpha1.IngressNodeFirewallProtoRule{Ports: intstr.FromInt(6443)}}},
+		}
+		for _, tt := range tests {
+			It(tt.name, func() {
+				inf := getIngressNodeFirewall("br-ex-failsafe")
+				configInterfaces(inf, tt.interfaces)
+				inf.Spec.Ingress = []ingressnodefwv1alpha1.IngressNodeFirewallRules{{
+					SourceCIDRs: []string{"0.0.0.0/0"},
+					FirewallProtocolRules: []ingressnodefwv1alpha1.IngressNodeFirewallProtocolRule{{
+						Order: 1, Action: tt.action, ProtocolConfig: tt.protocol,
+					}},
+				}}
+				err := createIngressNodeFirewall(inf)
+				if tt.forbidden {
+					Expect(apierrors.IsInvalid(err)).To(BeTrue(), "expected admission to reject the rule: %v", err)
+					Expect(err.Error()).To(ContainSubstring("Forbidden"))
+				} else {
+					Expect(err).NotTo(HaveOccurred())
+					Expect(deleteIngressNodeFirewall(inf)).To(Succeed())
+				}
+			})
+		}
+	})
+
 })
 
 var _ = AfterSuite(func() {
